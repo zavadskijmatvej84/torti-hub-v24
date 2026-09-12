@@ -8717,6 +8717,7 @@ local WeaponDisplaySystem = (function()
 	local LocalPlayer = Players.LocalPlayer
 	local activeDisplays = {}
 	local displayCounter = 0
+	local debugPrinted = false
 
 	local ATTACHMENT_MAP = {
 		Knife = {part = "UpperTorso", name = "KnifeBack", fallbackPos = Vector3.new(-0.07, -0.18, 0.55)},
@@ -8757,47 +8758,27 @@ local WeaponDisplaySystem = (function()
 		end
 	end
 
-	local function findWeaponHandle(weaponKey)
-		-- Try ServerStorage.Database.Item (needs setthreadidentity(8))
-		pcall(function() setthreadidentity(8) end)
-		local weaponTool = ServerStorage:FindFirstChild("Database")
-		if weaponTool then weaponTool = weaponTool:FindFirstChild("Item") end
-		if weaponTool then weaponTool = weaponTool:FindFirstChild(weaponKey) end
-		if weaponTool then
-			local handle = weaponTool:FindFirstChild("Handle")
-			if handle then return handle end
+	local function findWeaponData(weaponKey)
+		-- Try _G.Database.Item (populated by GetSyncData)
+		if _G.Database and _G.Database.Item then
+			local data = _G.Database.Item[weaponKey]
+			if data then return data end
+		end
+		if _G.Database and _G.Database.Weapons then
+			local data = _G.Database.Weapons[weaponKey]
+			if data then return data end
 		end
 
-		-- Fallback: search in ReplicatedStorage
-		local repStorage = game:GetService("ReplicatedStorage")
-		local function searchInFolder(folder)
-			if not folder then return nil end
-			for _, child in ipairs(folder:GetChildren()) do
-				if child.Name == weaponKey then
-					local h = child:FindFirstChild("Handle")
-					if h then return h end
-				end
-				if child:IsA("Folder") or child:IsA("Model") then
-					local found = searchInFolder(child)
-					if found then return found end
-				end
+		-- Fallback: try Sync module directly
+		local success, Sync = pcall(function()
+			return require(game:GetService("ReplicatedStorage"):WaitForChild("Database"):WaitForChild("Sync"))
+		end)
+		if success and Sync then
+			if Sync.Item and Sync.Item[weaponKey] then
+				return Sync.Item[weaponKey]
 			end
-			return nil
-		end
-
-		local found = searchInFolder(repStorage)
-		if found then return found end
-
-		-- Fallback: find from equipped tools on any character
-		for _, player in ipairs(Players:GetPlayers()) do
-			local char = player.Character
-			if char then
-				for _, tool in ipairs(char:GetChildren()) do
-					if tool:IsA("Tool") and tool.Name == weaponKey then
-						local h = tool:FindFirstChild("Handle")
-						if h then return h end
-					end
-				end
+			if Sync.Weapons and Sync.Weapons[weaponKey] then
+				return Sync.Weapons[weaponKey]
 			end
 		end
 
@@ -8817,16 +8798,67 @@ local WeaponDisplaySystem = (function()
 			return
 		end
 
-		local originalHandle = findWeaponHandle(weaponKey)
-		if not originalHandle then
-			warn("[WeaponDisplay] Weapon not found:", weaponKey)
+		local weaponData = findWeaponData(weaponKey)
+		if not weaponData then
+			warn("[WeaponDisplay] Weapon data not found:", weaponKey)
 			return
 		end
 
-		local handle = originalHandle:Clone()
+		-- Debug: print weapon data fields (first time only)
+		if not debugPrinted then
+			debugPrinted = true
+			print("[WeaponDisplay] Sample weapon data for", weaponKey .. ":")
+			for field, value in pairs(weaponData) do
+				if type(value) ~= "table" then
+					print("  " .. field .. ":", tostring(value))
+				end
+			end
+		end
+
+		-- Create Part with SpecialMesh from weapon data
+		local handle = Instance.new("Part")
+		handle.Name = "Handle"
+		handle.Size = Vector3.new(0.4, 3, 0.7)
 		handle.CanCollide = false
 		handle.Massless = true
 		handle.Anchored = false
+		handle.CanQuery = false
+		handle.CanTouch = false
+		handle.Material = Enum.Material.Plastic
+		handle.Color = Color3.fromRGB(163, 162, 165)
+
+		local mesh = Instance.new("SpecialMesh")
+		mesh.MeshType = Enum.MeshType.FileMesh
+
+		-- Set mesh properties from weapon data
+		if weaponData.MeshId then
+			mesh.MeshId = weaponData.MeshId
+		end
+		if weaponData.TextureId then
+			mesh.TextureId = weaponData.TextureId
+		end
+		if weaponData.Scale then
+			if type(weaponData.Scale) == "number" then
+				mesh.Scale = Vector3.new(weaponData.Scale, weaponData.Scale, weaponData.Scale)
+			elseif type(weaponData.Scale) == "table" then
+				mesh.Scale = Vector3.new(
+					weaponData.Scale.X or weaponData.Scale[1] or 1,
+					weaponData.Scale.Y or weaponData.Scale[2] or 1,
+					weaponData.Scale.Z or weaponData.Scale[3] or 1
+				)
+			end
+		end
+		if weaponData.VertexColor then
+			if type(weaponData.VertexColor) == "table" then
+				mesh.VertexColor = Vector3.new(
+					weaponData.VertexColor.R or weaponData.VertexColor[1] or 1,
+					weaponData.VertexColor.G or weaponData.VertexColor[2] or 1,
+					weaponData.VertexColor.B or weaponData.VertexColor[3] or 1
+				)
+			end
+		end
+
+		mesh.Parent = handle
 		handle.CanQuery = false
 		handle.CanTouch = false
 
