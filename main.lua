@@ -8717,7 +8717,6 @@ local WeaponDisplaySystem = (function()
 	local LocalPlayer = Players.LocalPlayer
 	local activeDisplays = {}
 	local displayCounter = 0
-	local debugPrinted = false
 
 	local ATTACHMENT_MAP = {
 		Knife = {part = "UpperTorso", name = "KnifeBack", fallbackPos = Vector3.new(-0.07, -0.18, 0.55)},
@@ -8759,23 +8758,21 @@ local WeaponDisplaySystem = (function()
 	end
 
 	local function findWeaponHandle(weaponKey)
-		-- Strategy 1: Find equipped tool on any player with matching name
+		-- Strategy 1: Find equipped tool on any player
 		for _, player in ipairs(Players:GetPlayers()) do
 			local char = player.Character
 			if char then
-				-- Check Backpack
 				local backpack = player:FindFirstChild("Backpack")
 				if backpack then
 					for _, tool in ipairs(backpack:GetChildren()) do
-						if tool:IsA("Tool") and (tool.Name == weaponKey or tool:GetAttribute("ItemID") == weaponKey) then
+						if tool:IsA("Tool") and tool.Name == weaponKey then
 							local handle = tool:FindFirstChild("Handle")
 							if handle then return handle end
 						end
 					end
 				end
-				-- Check Character
 				for _, tool in ipairs(char:GetChildren()) do
-					if tool:IsA("Tool") and (tool.Name == weaponKey or tool:GetAttribute("ItemID") == weaponKey) then
+					if tool:IsA("Tool") and tool.Name == weaponKey then
 						local handle = tool:FindFirstChild("Handle")
 						if handle then return handle end
 					end
@@ -8783,16 +8780,65 @@ local WeaponDisplaySystem = (function()
 			end
 		end
 
-		-- Strategy 2: Search in Workspace for weapon models
+		-- Strategy 2: Load via InsertService using ItemID from _G.Database
+		local itemID = nil
+		if _G.Database and _G.Database.Item then
+			local data = _G.Database.Item[weaponKey]
+			if data and data.ItemID then
+				itemID = tonumber(data.ItemID)
+			end
+		end
+		if not itemID and _G.Database and _G.Database.Weapons then
+			local data = _G.Database.Weapons[weaponKey]
+			if data and data.ItemID then
+				itemID = tonumber(data.ItemID)
+			end
+		end
+
+		if itemID then
+			print("[WeaponDisplay] Loading asset ID", itemID, "for", weaponKey)
+			pcall(function() setthreadidentity(2) end)
+			local InsertService = game:GetService("InsertService")
+			local success, model = pcall(function()
+				return InsertService:LoadAsset(itemID)
+			end)
+			if success and model then
+				print("[WeaponDisplay] Asset loaded successfully for", weaponKey)
+				local handle = model:FindFirstChild("Handle")
+				if handle then
+					handle.Parent = workspace
+					model:Destroy()
+					pcall(function() setthreadidentity(8) end)
+					return handle
+				end
+				-- Search recursively
+				local function findHandleRecursive(parent)
+					for _, child in ipairs(parent:GetChildren()) do
+						if child.Name == "Handle" then return child end
+						local found = findHandleRecursive(child)
+						if found then return found end
+					end
+					return nil
+				end
+				local h = findHandleRecursive(model)
+				if h then
+					h.Parent = workspace
+					model:Destroy()
+					pcall(function() setthreadidentity(8) end)
+					return h
+				end
+				model:Destroy()
+			end
+		end
+
+		-- Strategy 3: Search Workspace for any Tool with matching name
 		local function searchWorkspace(parent, depth)
 			depth = depth or 0
-			if depth > 3 then return nil end
+			if depth > 4 then return nil end
 			for _, child in ipairs(parent:GetChildren()) do
-				if child:IsA("Tool") then
+				if child:IsA("Tool") and child.Name == weaponKey then
 					local handle = child:FindFirstChild("Handle")
-					if handle and (child.Name == weaponKey or child:GetAttribute("ItemID") == weaponKey) then
-						return handle
-					end
+					if handle then return handle end
 				end
 				if child:IsA("Folder") or child:IsA("Model") then
 					local found = searchWorkspace(child, depth + 1)
@@ -8802,28 +8848,7 @@ local WeaponDisplaySystem = (function()
 			return nil
 		end
 
-		local found = searchWorkspace(workspace)
-		if found then return found end
-
-		-- Strategy 3: Try to load asset via InsertService (server-side only, but worth trying)
-		local success, InsertService = pcall(function()
-			return game:GetService("InsertService")
-		end)
-		if success then
-			local assetSuccess, model = pcall(function()
-				return InsertService:LoadAsset(tonumber(weaponKey) or 0)
-			end)
-			if assetSuccess and model then
-				local handle = model:FindFirstChild("Handle")
-				if handle then
-					handle.Parent = workspace
-					model:Destroy()
-					return handle
-				end
-			end
-		end
-
-		return nil
+		return searchWorkspace(workspace)
 	end
 
 	local function createWeaponDisplay(weaponKey, weaponType)
