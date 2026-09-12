@@ -8718,21 +8718,23 @@ local WeaponDisplaySystem = (function()
 	local activeDisplays = {}
 	local displayCounter = 0
 
-	local DISPLAY_POSITIONS = {
-		Knife = {
-			bodyPart = "UpperTorso",
-			offset = CFrame.new(-0.4, -0.3, 0.5),
-			rotation = CFrame.Angles(math.rad(-90), math.rad(45), math.rad(90)),
-		},
-		Gun = {
-			bodyPart = "UpperTorso",
-			offset = CFrame.new(0.4, -0.6, -0.4),
-			rotation = CFrame.Angles(math.rad(15), math.rad(10), math.rad(0)),
-		},
+	local ATTACHMENT_MAP = {
+		Knife = {part = "UpperTorso", name = "KnifeBack", fallbackPos = Vector3.new(-0.07, -0.18, 0.55)},
+		Gun   = {part = "LowerTorso", name = "GunBelt",     fallbackPos = Vector3.new(0.84, -0.26, 0.00)},
 	}
 
-	local function getBodyPart(character, partName)
-		return character:FindFirstChild(partName)
+	local function getBodyAttachment(character, weaponType)
+		local map = ATTACHMENT_MAP[weaponType]
+		if not map then return nil end
+		local bodyPart = character:FindFirstChild(map.part)
+		if not bodyPart then return nil end
+		local existing = bodyPart:FindFirstChild(map.name)
+		if existing then return existing end
+		local att = Instance.new("Attachment")
+		att.Name = map.name
+		att.CFrame = CFrame.new(map.fallbackPos)
+		att.Parent = bodyPart
+		return att
 	end
 
 	local function clearDisplay(id)
@@ -8762,10 +8764,9 @@ local WeaponDisplaySystem = (function()
 			return
 		end
 
-		local positions = DISPLAY_POSITIONS[weaponType] or DISPLAY_POSITIONS.Knife
-		local bodyPart = getBodyPart(character, positions.bodyPart)
-		if not bodyPart then
-			warn("[WeaponDisplay] Body part not found:", positions.bodyPart)
+		local bodyAttachment = getBodyAttachment(character, weaponType)
+		if not bodyAttachment then
+			warn("[WeaponDisplay] Body attachment not found for:", weaponType)
 			return
 		end
 
@@ -8788,15 +8789,8 @@ local WeaponDisplaySystem = (function()
 		handle.CanCollide = false
 		handle.Massless = true
 		handle.Anchored = false
-		handle.Parent = workspace
-
-		local weld = Instance.new("WeldConstraint")
-		weld.Name = "WeaponDisplayWeld"
-		weld.Part0 = bodyPart
-		weld.Part1 = handle
-		weld.C0 = positions.offset * positions.rotation
-		weld.C1 = CFrame.new(0, 0, 0)
-		weld.Parent = handle
+		handle.CanQuery = false
+		handle.CanTouch = false
 
 		local weaponDisplays = workspace:FindFirstChild("WeaponDisplays")
 		if not weaponDisplays then
@@ -8807,11 +8801,33 @@ local WeaponDisplaySystem = (function()
 
 		displayCounter = displayCounter + 1
 		local displayId = weaponKey .. "_" .. displayCounter
-		handle.Name = "WeaponDisplay_" .. displayId
+		handle.Name = weaponType .. "Display"
 		handle.Parent = weaponDisplays
 
+		local weaponAttachment = handle:FindFirstChild("Attachment")
+		if not weaponAttachment then
+			weaponAttachment = Instance.new("Attachment")
+			weaponAttachment.Name = "Attachment"
+			weaponAttachment.CFrame = CFrame.new(0, 0, 0)
+			weaponAttachment.Parent = handle
+		end
+
+		local constraint = Instance.new("RigidConstraint")
+		constraint.Attachment0 = bodyAttachment
+		constraint.Attachment1 = weaponAttachment
+		constraint.Name = "WeaponDisplayConstraint"
+		constraint.Parent = handle
+
+		local displayRef = character:FindFirstChild("DisplayRef" .. weaponType)
+		if not displayRef then
+			displayRef = Instance.new("ObjectValue")
+			displayRef.Name = "DisplayRef" .. weaponType
+			displayRef.Parent = character
+		end
+		displayRef.Value = handle
+
 		activeDisplays[displayId] = {
-			parts = {handle, weld},
+			parts = {handle, constraint},
 			weaponType = weaponType,
 			weaponKey = weaponKey,
 		}
@@ -8832,12 +8848,22 @@ local WeaponDisplaySystem = (function()
 	local function unequipWeapon(weaponType)
 		weaponType = weaponType or "Knife"
 		clearAllOfType(weaponType)
+		local character = LocalPlayer.Character
+		if character then
+			local ref = character:FindFirstChild("DisplayRef" .. weaponType)
+			if ref then ref.Value = nil end
+		end
 	end
 
 	local function clearAll()
+		local character = LocalPlayer.Character
 		for id, data in pairs(activeDisplays) do
 			for _, obj in pairs(data.parts) do
 				pcall(function() obj:Destroy() end)
+			end
+			if character then
+				local ref = character:FindFirstChild("DisplayRef" .. data.weaponType)
+				if ref then ref.Value = nil end
 			end
 		end
 		activeDisplays = {}
