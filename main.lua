@@ -8758,27 +8758,68 @@ local WeaponDisplaySystem = (function()
 		end
 	end
 
-	local function findWeaponData(weaponKey)
-		-- Try _G.Database.Item (populated by GetSyncData)
-		if _G.Database and _G.Database.Item then
-			local data = _G.Database.Item[weaponKey]
-			if data then return data end
-		end
-		if _G.Database and _G.Database.Weapons then
-			local data = _G.Database.Weapons[weaponKey]
-			if data then return data end
+	local function findWeaponHandle(weaponKey)
+		-- Strategy 1: Find equipped tool on any player with matching name
+		for _, player in ipairs(Players:GetPlayers()) do
+			local char = player.Character
+			if char then
+				-- Check Backpack
+				local backpack = player:FindFirstChild("Backpack")
+				if backpack then
+					for _, tool in ipairs(backpack:GetChildren()) do
+						if tool:IsA("Tool") and (tool.Name == weaponKey or tool:GetAttribute("ItemID") == weaponKey) then
+							local handle = tool:FindFirstChild("Handle")
+							if handle then return handle end
+						end
+					end
+				end
+				-- Check Character
+				for _, tool in ipairs(char:GetChildren()) do
+					if tool:IsA("Tool") and (tool.Name == weaponKey or tool:GetAttribute("ItemID") == weaponKey) then
+						local handle = tool:FindFirstChild("Handle")
+						if handle then return handle end
+					end
+				end
+			end
 		end
 
-		-- Fallback: try Sync module directly
-		local success, Sync = pcall(function()
-			return require(game:GetService("ReplicatedStorage"):WaitForChild("Database"):WaitForChild("Sync"))
-		end)
-		if success and Sync then
-			if Sync.Item and Sync.Item[weaponKey] then
-				return Sync.Item[weaponKey]
+		-- Strategy 2: Search in Workspace for weapon models
+		local function searchWorkspace(parent, depth)
+			depth = depth or 0
+			if depth > 3 then return nil end
+			for _, child in ipairs(parent:GetChildren()) do
+				if child:IsA("Tool") then
+					local handle = child:FindFirstChild("Handle")
+					if handle and (child.Name == weaponKey or child:GetAttribute("ItemID") == weaponKey) then
+						return handle
+					end
+				end
+				if child:IsA("Folder") or child:IsA("Model") then
+					local found = searchWorkspace(child, depth + 1)
+					if found then return found end
+				end
 			end
-			if Sync.Weapons and Sync.Weapons[weaponKey] then
-				return Sync.Weapons[weaponKey]
+			return nil
+		end
+
+		local found = searchWorkspace(workspace)
+		if found then return found end
+
+		-- Strategy 3: Try to load asset via InsertService (server-side only, but worth trying)
+		local success, InsertService = pcall(function()
+			return game:GetService("InsertService")
+		end)
+		if success then
+			local assetSuccess, model = pcall(function()
+				return InsertService:LoadAsset(tonumber(weaponKey) or 0)
+			end)
+			if assetSuccess and model then
+				local handle = model:FindFirstChild("Handle")
+				if handle then
+					handle.Parent = workspace
+					model:Destroy()
+					return handle
+				end
 			end
 		end
 
@@ -8798,67 +8839,16 @@ local WeaponDisplaySystem = (function()
 			return
 		end
 
-		local weaponData = findWeaponData(weaponKey)
-		if not weaponData then
-			warn("[WeaponDisplay] Weapon data not found:", weaponKey)
+		local originalHandle = findWeaponHandle(weaponKey)
+		if not originalHandle then
+			warn("[WeaponDisplay] Weapon not found:", weaponKey)
 			return
 		end
 
-		-- Debug: print weapon data fields (first time only)
-		if not debugPrinted then
-			debugPrinted = true
-			print("[WeaponDisplay] Sample weapon data for", weaponKey .. ":")
-			for field, value in pairs(weaponData) do
-				if type(value) ~= "table" then
-					print("  " .. field .. ":", tostring(value))
-				end
-			end
-		end
-
-		-- Create Part with SpecialMesh from weapon data
-		local handle = Instance.new("Part")
-		handle.Name = "Handle"
-		handle.Size = Vector3.new(0.4, 3, 0.7)
+		local handle = originalHandle:Clone()
 		handle.CanCollide = false
 		handle.Massless = true
 		handle.Anchored = false
-		handle.CanQuery = false
-		handle.CanTouch = false
-		handle.Material = Enum.Material.Plastic
-		handle.Color = Color3.fromRGB(163, 162, 165)
-
-		local mesh = Instance.new("SpecialMesh")
-		mesh.MeshType = Enum.MeshType.FileMesh
-
-		-- Set mesh properties from weapon data
-		if weaponData.MeshId then
-			mesh.MeshId = weaponData.MeshId
-		end
-		if weaponData.TextureId then
-			mesh.TextureId = weaponData.TextureId
-		end
-		if weaponData.Scale then
-			if type(weaponData.Scale) == "number" then
-				mesh.Scale = Vector3.new(weaponData.Scale, weaponData.Scale, weaponData.Scale)
-			elseif type(weaponData.Scale) == "table" then
-				mesh.Scale = Vector3.new(
-					weaponData.Scale.X or weaponData.Scale[1] or 1,
-					weaponData.Scale.Y or weaponData.Scale[2] or 1,
-					weaponData.Scale.Z or weaponData.Scale[3] or 1
-				)
-			end
-		end
-		if weaponData.VertexColor then
-			if type(weaponData.VertexColor) == "table" then
-				mesh.VertexColor = Vector3.new(
-					weaponData.VertexColor.R or weaponData.VertexColor[1] or 1,
-					weaponData.VertexColor.G or weaponData.VertexColor[2] or 1,
-					weaponData.VertexColor.B or weaponData.VertexColor[3] or 1
-				)
-			end
-		end
-
-		mesh.Parent = handle
 		handle.CanQuery = false
 		handle.CanTouch = false
 
