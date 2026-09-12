@@ -8757,6 +8757,53 @@ local WeaponDisplaySystem = (function()
 		end
 	end
 
+	local function findWeaponHandle(weaponKey)
+		-- Try ServerStorage.Database.Item (needs setthreadidentity(8))
+		pcall(function() setthreadidentity(8) end)
+		local weaponTool = ServerStorage:FindFirstChild("Database")
+		if weaponTool then weaponTool = weaponTool:FindFirstChild("Item") end
+		if weaponTool then weaponTool = weaponTool:FindFirstChild(weaponKey) end
+		if weaponTool then
+			local handle = weaponTool:FindFirstChild("Handle")
+			if handle then return handle end
+		end
+
+		-- Fallback: search in ReplicatedStorage
+		local repStorage = game:GetService("ReplicatedStorage")
+		local function searchInFolder(folder)
+			if not folder then return nil end
+			for _, child in ipairs(folder:GetChildren()) do
+				if child.Name == weaponKey then
+					local h = child:FindFirstChild("Handle")
+					if h then return h end
+				end
+				if child:IsA("Folder") or child:IsA("Model") then
+					local found = searchInFolder(child)
+					if found then return found end
+				end
+			end
+			return nil
+		end
+
+		local found = searchInFolder(repStorage)
+		if found then return found end
+
+		-- Fallback: find from equipped tools on any character
+		for _, player in ipairs(Players:GetPlayers()) do
+			local char = player.Character
+			if char then
+				for _, tool in ipairs(char:GetChildren()) do
+					if tool:IsA("Tool") and tool.Name == weaponKey then
+						local h = tool:FindFirstChild("Handle")
+						if h then return h end
+					end
+				end
+			end
+		end
+
+		return nil
+	end
+
 	local function createWeaponDisplay(weaponKey, weaponType)
 		local character = LocalPlayer.Character
 		if not character then
@@ -8770,18 +8817,9 @@ local WeaponDisplaySystem = (function()
 			return
 		end
 
-		local weaponTool = ServerStorage:FindFirstChild("Database")
-		if weaponTool then weaponTool = weaponTool:FindFirstChild("Item") end
-		if weaponTool then weaponTool = weaponTool:FindFirstChild(weaponKey) end
-
-		if not weaponTool then
-			warn("[WeaponDisplay] Weapon not found in ServerStorage:", weaponKey)
-			return
-		end
-
-		local originalHandle = weaponTool:FindFirstChild("Handle")
+		local originalHandle = findWeaponHandle(weaponKey)
 		if not originalHandle then
-			warn("[WeaponDisplay] No Handle in weapon:", weaponKey)
+			warn("[WeaponDisplay] Weapon not found:", weaponKey)
 			return
 		end
 
