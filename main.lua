@@ -8720,24 +8720,24 @@ local WeaponDisplaySystem = (function()
 
 	local DISPLAY_POSITIONS = {
 		Knife = {
-			offset = CFrame.new(-0.3, -0.2, 0.4),
+			bodyPart = "UpperTorso",
+			offset = CFrame.new(-0.4, -0.3, 0.5),
 			rotation = CFrame.Angles(math.rad(-90), math.rad(45), math.rad(90)),
 		},
 		Gun = {
-			offset = CFrame.new(0.35, -0.5, -0.3),
+			bodyPart = "UpperTorso",
+			offset = CFrame.new(0.4, -0.6, -0.4),
 			rotation = CFrame.Angles(math.rad(15), math.rad(10), math.rad(0)),
 		},
 	}
 
-	local function getBodyAttachment(character)
-		return character:FindFirstChild("UpperTorso")
-			or character:FindFirstChild("Torso")
-			or character:FindFirstChild("HumanoidRootPart")
+	local function getBodyPart(character, partName)
+		return character:FindFirstChild(partName)
 	end
 
 	local function clearDisplay(id)
 		if activeDisplays[id] then
-			for _, obj in pairs(activeDisplays[id]) do
+			for _, obj in pairs(activeDisplays[id].parts) do
 				pcall(function() obj:Destroy() end)
 			end
 			activeDisplays[id] = nil
@@ -8762,9 +8762,10 @@ local WeaponDisplaySystem = (function()
 			return
 		end
 
-		local bodyPart = getBodyAttachment(character)
+		local positions = DISPLAY_POSITIONS[weaponType] or DISPLAY_POSITIONS.Knife
+		local bodyPart = getBodyPart(character, positions.bodyPart)
 		if not bodyPart then
-			warn("[WeaponDisplay] No body part found (UpperTorso/Torso/HRP)")
+			warn("[WeaponDisplay] Body part not found:", positions.bodyPart)
 			return
 		end
 
@@ -8787,24 +8788,15 @@ local WeaponDisplaySystem = (function()
 		handle.CanCollide = false
 		handle.Massless = true
 		handle.Anchored = false
+		handle.Parent = workspace
 
-		local positions = DISPLAY_POSITIONS[weaponType] or DISPLAY_POSITIONS.Knife
-
-		local torsoAttachment = Instance.new("Attachment")
-		torsoAttachment.Name = "WeaponDisplayAttachment"
-		torsoAttachment.CFrame = positions.offset * positions.rotation
-		torsoAttachment.Parent = bodyPart
-
-		local weaponAttachment = Instance.new("Attachment")
-		weaponAttachment.Name = "WeaponDisplayAttachment"
-		weaponAttachment.CFrame = CFrame.new(0, 0, 0)
-		weaponAttachment.Parent = handle
-
-		local constraint = Instance.new("RigidConstraint")
-		constraint.Attachment0 = torsoAttachment
-		constraint.Attachment1 = weaponAttachment
-		constraint.Name = "WeaponDisplayConstraint"
-		constraint.Parent = handle
+		local weld = Instance.new("WeldConstraint")
+		weld.Name = "WeaponDisplayWeld"
+		weld.Part0 = bodyPart
+		weld.Part1 = handle
+		weld.C0 = positions.offset * positions.rotation
+		weld.C1 = CFrame.new(0, 0, 0)
+		weld.Parent = handle
 
 		local weaponDisplays = workspace:FindFirstChild("WeaponDisplays")
 		if not weaponDisplays then
@@ -8819,7 +8811,7 @@ local WeaponDisplaySystem = (function()
 		handle.Parent = weaponDisplays
 
 		activeDisplays[displayId] = {
-			parts = {handle, torsoAttachment, constraint},
+			parts = {handle, weld},
 			weaponType = weaponType,
 			weaponKey = weaponKey,
 		}
