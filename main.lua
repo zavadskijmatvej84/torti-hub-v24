@@ -7282,8 +7282,18 @@ local function decodeJson(text)
 	return nil
 end
 
+local function fileExists(path)
+	if type(isfile) == "function" then
+		local ok, exists = pcall(isfile, path)
+		if ok then return exists == true end
+	end
+	-- Fallback for executors that only expose readfile.
+	local ok, content = pcall(readfile, path)
+	return ok and type(content) == "string"
+end
+
 local function readConfigData(path)
-	if not isfile(path) then return nil, "file not found" end
+	if not fileExists(path) then return nil, "file not found" end
 	local ok, content = pcall(readfile, path)
 	if not ok or type(content) ~= "string" or content == "" then
 		return nil, "unreadable"
@@ -7370,7 +7380,7 @@ local function saveConfig(rawName)
 		if not verify then
 			error("saved file did not validate")
 		end
-		if isfile(path) then
+		if fileExists(path) then
 			local oldContent = nil
 			pcall(function() oldContent = readfile(path) end)
 			if type(oldContent) == "string" and oldContent ~= "" then
