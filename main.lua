@@ -9063,9 +9063,9 @@ local WeaponDisplaySystem = (function()
 			if not att.Parent or not att:IsDescendantOf(character) then
 				mountAttachments[weaponType] = nil
 			else
-				local side = weaponType == "Gun" and -0.55 or 0.55
+				local side = weaponType == "Gun" and -0.85 or 0.85
 				local height = weaponType == "Gun" and -0.15 or 0.35
-				local offset = dir * 1.55 + lateral * side + Vector3.new(0, height, 0)
+				local offset = dir * 2.40 + lateral * side + Vector3.new(0, height, 0)
 				att.CFrame = CFrame.new(offset)
 			end
 		end
