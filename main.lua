@@ -4353,7 +4353,7 @@ titleBar.Parent = mainPanel
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -56, 0, 28)
 title.BackgroundTransparency = 1
-title.Text = "Torti hub v2.4"
+title.Text = "Torti hub v2.5"
 title.Font = Enum.Font.GothamBold
 title.TextSize = 24
 title.TextColor3 = WINDOW_THEME.panelText
@@ -9022,17 +9022,33 @@ local WeaponDisplaySystem = (function()
 	local watchedCharacters = setmetatable({}, {__mode = "k"})
 	local displayCounter = 0
 
+	-- Remove displays left behind by an older run of the hub. Those orphaned
+	-- parts never followed a respawn and were the reason weapons could look
+	-- like they were missing from the player.
+	do
+		local staleFolder = workspace:FindFirstChild("WeaponDisplays")
+		if staleFolder then
+			for _, child in ipairs(staleFolder:GetChildren()) do
+				pcall(function() child:Destroy() end)
+			end
+		end
+	end
+
+	-- Side-mounted placement. The old KnifeBack/GunBelt spots sat behind the
+	-- right arm: the weapon was technically attached but the body occluded it
+	-- from the normal third-person camera. These positions are outside the
+	-- arm silhouette and stay visible from the front and the side.
 	local ATTACHMENT_MAP = {
 		Knife = {
 			parts = {"UpperTorso", "Torso"},
-			name = "KnifeBack",
-			fallbackPos = Vector3.new(-0.07, -0.18, 0.55),
-			fallbackAngles = Vector3.new(0, 0, -18),
+			name = "KnifeSide",
+			fallbackPos = Vector3.new(1.22, 0.15, -0.18),
+			fallbackAngles = Vector3.new(0, 0, 0),
 		},
 		Gun = {
-			parts = {"LowerTorso", "Torso"},
-			name = "GunBelt",
-			fallbackPos = Vector3.new(0.84, -0.26, 0.00),
+			parts = {"UpperTorso", "Torso"},
+			name = "GunSide",
+			fallbackPos = Vector3.new(-1.22, 0.15, -0.18),
 			fallbackAngles = Vector3.new(0, 0, 0),
 		},
 	}
@@ -9046,16 +9062,19 @@ local WeaponDisplaySystem = (function()
 			if bodyPart then break end
 		end
 		if not bodyPart then return nil end
-		local existing = bodyPart:FindFirstChild(map.name)
-		if existing and existing:IsA("Attachment") then return existing end
-		local att = Instance.new("Attachment")
-		att.Name = map.name
+		local desiredCFrame = CFrame.new(map.fallbackPos)
 		local angles = map.fallbackAngles
 		if angles then
-			att.CFrame = CFrame.new(map.fallbackPos) * CFrame.Angles(math.rad(angles.X), math.rad(angles.Y), math.rad(angles.Z))
-		else
-			att.CFrame = CFrame.new(map.fallbackPos)
+			desiredCFrame = desiredCFrame * CFrame.Angles(math.rad(angles.X), math.rad(angles.Y), math.rad(angles.Z))
 		end
+		local existing = bodyPart:FindFirstChild(map.name)
+		if existing and existing:IsA("Attachment") then
+			existing.CFrame = desiredCFrame
+			return existing
+		end
+		local att = Instance.new("Attachment")
+		att.Name = map.name
+		att.CFrame = desiredCFrame
 		att.Parent = bodyPart
 		return att
 	end
@@ -9478,8 +9497,24 @@ local WeaponDisplaySystem = (function()
 	end
 
 	LocalPlayer.CharacterAdded:Connect(function(character)
+		-- Keep fake displays alive across respawns instead of leaving orphaned
+		-- weapon parts at the old character's position.
+		local fakeToRestore = {}
+		for _, display in pairs(activeDisplays) do
+			if display.owners and display.owners.fake then
+				fakeToRestore[display.weaponKey] = true
+			end
+		end
 		clearAll()
 		task.defer(watchCharacter, character)
+		task.defer(function()
+			task.wait(0.6)
+			for weaponKey in pairs(fakeToRestore) do
+				pcall(function()
+					createWeaponDisplay(weaponKey, getWeaponType(weaponKey), "fake")
+				end)
+			end
+		end)
 	end)
 	if LocalPlayer.Character then
 		task.defer(watchCharacter, LocalPlayer.Character)
