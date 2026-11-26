@@ -1663,6 +1663,8 @@ do
 		}
 	end
 
+	local buildValuedEntries
+
 	local function buildInventorySnapshotFromCounts(countsByType)
 		local weaponEntries, weaponTotals = buildValuedEntries((countsByType and countsByType.Weapons) or {}, "Weapons")
 		local petEntries, petTotals = buildValuedEntries((countsByType and countsByType.Pets) or {}, "Pets")
@@ -1697,7 +1699,6 @@ do
 		return total
 	end
 
-	local buildValuedEntries
 	buildValuedEntries = function(counts, itemType)
 		local entries = {}
 		local totals = {
@@ -9026,7 +9027,7 @@ local WeaponDisplaySystem = (function()
 	-- parts never followed a respawn and were the reason weapons could look
 	-- like they were missing from the player.
 	do
-		local staleFolder = workspace:FindFirstChild("WeaponDisplays")
+		local staleFolder = workspace:FindFirstChild("TortiHubDisplays")
 		if staleFolder then
 			for _, child in ipairs(staleFolder:GetChildren()) do
 				pcall(function() child:Destroy() end)
@@ -9034,48 +9035,60 @@ local WeaponDisplaySystem = (function()
 		end
 	end
 
-	-- Side-mounted placement. The old KnifeBack/GunBelt spots sat behind the
-	-- right arm: the weapon was technically attached but the body occluded it
-	-- from the normal third-person camera. These positions are outside the
-	-- arm silhouette and stay visible from the front and the side.
-	local ATTACHMENT_MAP = {
-		Knife = {
-			parts = {"UpperTorso", "Torso"},
-			name = "KnifeSide",
-			fallbackPos = Vector3.new(1.22, 0.15, -0.18),
-			fallbackAngles = Vector3.new(0, 0, 0),
-		},
-		Gun = {
-			parts = {"UpperTorso", "Torso"},
-			name = "GunSide",
-			fallbackPos = Vector3.new(-1.22, 0.15, -0.18),
-			fallbackAngles = Vector3.new(0, 0, 0),
-		},
-	}
+	-- Camera-facing mount. A static holster position is either hidden behind
+	-- the torso/arm or pushed off-screen depending on where the player's camera
+	-- is. This keeps the weapon on the near side of the character, outside the
+	-- arm silhouette, so it is visible from normal third-person angles.
+	local RunService = game:GetService("RunService")
+	local mountAttachments = {}
+	local mountConnection = nil
 
-	local function getBodyAttachment(character, weaponType)
-		local map = ATTACHMENT_MAP[weaponType]
-		if not map then return nil end
-		local bodyPart = nil
-		for _, partName in ipairs(map.parts) do
-			bodyPart = character:FindFirstChild(partName)
-			if bodyPart then break end
+	local function getMountPart(character)
+		if not character then return nil end
+		return character:FindFirstChild("HumanoidRootPart")
+			or character:FindFirstChild("UpperTorso")
+			or character:FindFirstChild("Torso")
+	end
+
+	local function updateMountAttachments()
+		local character = LocalPlayer.Character
+		local part = getMountPart(character)
+		local camera = workspace.CurrentCamera
+		if not part or not camera then return end
+		local camLocal = part.CFrame:PointToObjectSpace(camera.CFrame.Position)
+		local flat = Vector3.new(camLocal.X, 0, camLocal.Z)
+		local dir = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, 1)
+		local lateral = Vector3.new(dir.Z, 0, -dir.X)
+		for weaponType, att in pairs(mountAttachments) do
+			if not att.Parent or not att:IsDescendantOf(character) then
+				mountAttachments[weaponType] = nil
+			else
+				local side = weaponType == "Gun" and -0.55 or 0.55
+				local height = weaponType == "Gun" and -0.15 or 0.35
+				local offset = dir * 1.55 + lateral * side + Vector3.new(0, height, 0)
+				att.CFrame = CFrame.new(offset)
+			end
 		end
-		if not bodyPart then return nil end
-		local desiredCFrame = CFrame.new(map.fallbackPos)
-		local angles = map.fallbackAngles
-		if angles then
-			desiredCFrame = desiredCFrame * CFrame.Angles(math.rad(angles.X), math.rad(angles.Y), math.rad(angles.Z))
+	end
+
+	local function getMountAttachment(character, weaponType)
+		local part = getMountPart(character)
+		if not part then return nil end
+		local name = "WeaponMount" .. tostring(weaponType)
+		local att = part:FindFirstChild(name)
+		if not (att and att:IsA("Attachment")) then
+			att = Instance.new("Attachment")
+			att.Name = name
+			att.Parent = part
 		end
-		local existing = bodyPart:FindFirstChild(map.name)
-		if existing and existing:IsA("Attachment") then
-			existing.CFrame = desiredCFrame
-			return existing
+		mountAttachments[weaponType] = att
+		updateMountAttachments()
+		if not mountConnection then
+			mountConnection = RunService.RenderStepped:Connect(function()
+				if next(mountAttachments) == nil then return end
+				pcall(updateMountAttachments)
+			end)
 		end
-		local att = Instance.new("Attachment")
-		att.Name = map.name
-		att.CFrame = desiredCFrame
-		att.Parent = bodyPart
 		return att
 	end
 
@@ -9152,7 +9165,7 @@ local WeaponDisplaySystem = (function()
 	local function isInsideDisplaysFolder(instance)
 		local node = instance
 		while node do
-			if node.Name == "WeaponDisplays" and node.Parent == workspace then
+			if node.Name == "TortiHubDisplays" and node.Parent == workspace then
 				return true
 			end
 			node = node.Parent
@@ -9336,7 +9349,7 @@ local WeaponDisplaySystem = (function()
 			return nil, false
 		end
 
-		local bodyAttachment = getBodyAttachment(character, weaponType)
+		local bodyAttachment = getMountAttachment(character, weaponType)
 		if not bodyAttachment then
 			return nil, false
 		end
@@ -9371,10 +9384,10 @@ local WeaponDisplaySystem = (function()
 			end
 		end
 
-		local weaponDisplays = workspace:FindFirstChild("WeaponDisplays")
+		local weaponDisplays = workspace:FindFirstChild("TortiHubDisplays")
 		if not weaponDisplays then
 			weaponDisplays = Instance.new("Folder")
-			weaponDisplays.Name = "WeaponDisplays"
+			weaponDisplays.Name = "TortiHubDisplays"
 			weaponDisplays.Parent = workspace
 		end
 
@@ -9449,6 +9462,9 @@ local WeaponDisplaySystem = (function()
 		end
 		activeDisplays = {}
 		activeByKey = {}
+		for weaponType in pairs(mountAttachments) do
+			mountAttachments[weaponType] = nil
+		end
 		for tool in pairs(equippedDisplays) do
 			equippedDisplays[tool] = nil
 		end
