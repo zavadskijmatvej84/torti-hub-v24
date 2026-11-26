@@ -9295,7 +9295,7 @@ local WeaponDisplaySystem = (function()
 	local function buildFallbackHandle(weaponKey, weaponType)
 		local handle = Instance.new("Part")
 		handle.Name = "Handle"
-		handle.Size = Vector3.new(0.16, 0.16, 0.65)
+		handle.Size = Vector3.new(0.20, 0.20, 1.00)
 		handle.Color = weaponType == "Gun" and Color3.fromRGB(55, 65, 80) or Color3.fromRGB(190, 195, 205)
 		handle.Material = Enum.Material.Metal
 		handle.Anchored = false
@@ -9317,13 +9317,13 @@ local WeaponDisplaySystem = (function()
 		blade.TopSurface = Enum.SurfaceType.Smooth
 		blade.BottomSurface = Enum.SurfaceType.Smooth
 		if weaponType == "Gun" then
-			blade.Size = Vector3.new(0.12, 0.12, 0.55)
-			blade.Color = Color3.fromRGB(35, 35, 40)
-			blade.CFrame = CFrame.new(0, 0.03, -0.42)
+			blade.Size = Vector3.new(0.18, 0.18, 1.45)
+			blade.Color = Color3.fromRGB(45, 45, 55)
+			blade.CFrame = CFrame.new(0, 0.03, -1.05)
 		else
-			blade.Size = Vector3.new(0.07, 0.25, 0.7)
-			blade.Color = Color3.fromRGB(205, 210, 220)
-			blade.CFrame = CFrame.new(0, 0.08, -0.58)
+			blade.Size = Vector3.new(0.12, 0.32, 2.10)
+			blade.Color = Color3.fromRGB(215, 222, 235)
+			blade.CFrame = CFrame.new(0, 0.06, -1.45)
 		end
 		blade.Parent = handle
 		local weld = Instance.new("WeldConstraint")
