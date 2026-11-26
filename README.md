@@ -1,4 +1,4 @@
-# Torti Hub Extended v2.4
+# Torti Hub Extended v2.5
 
 MM2 Trade Hub с системой визуального отображения оружия.
 

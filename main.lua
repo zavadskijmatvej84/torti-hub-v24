@@ -892,6 +892,66 @@ do
 	end)
 end
 
+-- === Weapon inclusion rules (live Sync-driven, no manual list catch-up) ===
+-- Every weapon released in 2024+ is picked up automatically. All high-rarity
+-- weapons are included as well, so new Godlies/Ancients/Chromas never need to
+-- be hardcoded into the hub again.
+local AUTO_WEAPON_MIN_YEAR = 2024
+local AUTO_WEAPON_RARITIES = {
+	Chroma = true,
+	Godly = true,
+	Ancient = true,
+	Unique = true,
+}
+
+local function GetWeaponSyncData(entry)
+	if type(entry) ~= "table" or entry.key == nil then
+		return nil
+	end
+	local key = entry.key
+	if type(Sync.Weapons) == "table" and type(Sync.Weapons[key]) == "table" then
+		return Sync.Weapons[key]
+	end
+	if type(Sync.Item) == "table" and type(Sync.Item[key]) == "table" then
+		return Sync.Item[key]
+	end
+	return nil
+end
+
+local function IsWeaponDataTradable(data)
+	if type(data) ~= "table" then
+		return false
+	end
+	if data.Tradable == false or data.CanTrade == false or data.Untradable == true or data.NonTradable == true or data.Locked == true then
+		return false
+	end
+	return true
+end
+
+local function ResolveWeaponCatalogEntry(nameOrKey)
+	if type(nameOrKey) ~= "string" or nameOrKey == "" then
+		return nil
+	end
+	return WeaponByKey[nameOrKey]
+		or WeaponByName[string.lower(nameOrKey)]
+		or WeaponByNormalizedName[NormalizeItemName(nameOrKey)]
+end
+
+local function ShouldAutoIncludeWeapon(entry)
+	if type(entry) ~= "table" then
+		return false
+	end
+	local data = GetWeaponSyncData(entry)
+	if data and not IsWeaponDataTradable(data) then
+		return false
+	end
+	if entry.chroma == true or AUTO_WEAPON_RARITIES[entry.rarity] then
+		return true
+	end
+	local year = tonumber(data and data.Year)
+	return year ~= nil and year >= AUTO_WEAPON_MIN_YEAR
+end
+
 -- === Basic item checks ===
 local InventoryOverlay = (function()
 	local overlayTypes = {
@@ -3071,9 +3131,10 @@ local function GiveItem(ItemName, Amount, ItemType)
 		InventoryOverlay.AdjustVisibleOwnedAmount(ItemName, Amount, ItemType, true)
 		ItemPopupService.ItemReceived:Fire(ItemName, ItemType)
 	end)
-	if ItemType == "Weapons" then
-		pcall(function() CleanupFakeItemsForWeapon(ItemName) end)
-	end
+	-- Receiving a real copy of a weapon must NOT delete a fake display that is
+	-- already on the character. The old auto-cleanup here made fake weapons
+	-- vanish as soon as a real one was traded in. Cleanup is manual now
+	-- (_G.CleanupFakeItemsForWeapon) and only removes what the user asks for.
 end
 
 local function RemoveItem(ItemName, Amount, ItemType)
@@ -3120,9 +3181,7 @@ local function AcceptTrade()
 				local itemName = item[1]
 				local amount = item[2]
 				local itemType = item[3]
-				if itemType == "Weapons" then
-					pcall(function() CleanupFakeItemsForWeapon(itemName) end)
-				end
+				-- Do not clean up a fake display for the weapon we are receiving.
 				pcall(function() GiveItem(itemName, amount, itemType) end)
 				pcall(function() _G.NewItem(itemName, "You Got...", nil, itemType, amount) end)
 			end
@@ -5557,7 +5616,15 @@ for _, n in ipairs(SpawnerAllowedBases) do
     SpawnerAllowSet[_itemsTabNormalize(n)] = true
 end
 
-local function _isSpawnerAllowed(entryName)
+local function _isSpawnerAllowed(entryName, entry)
+    -- Live Sync rule: every new/high-rarity weapon is allowed without touching
+    -- this file after a game update. The legacy list stays as a fallback for
+    -- entries that carry no Year/rarity metadata.
+    if entry and ShouldAutoIncludeWeapon(entry) then return true end
+    if not entry then
+        local resolved = ResolveWeaponCatalogEntry(entryName)
+        if resolved and ShouldAutoIncludeWeapon(resolved) then return true end
+    end
     local n = _itemsTabNormalize(entryName)
     if SpawnerAllowSet[n] then return true end
     local stripped = string.gsub(n, "^chroma ", "")
@@ -7176,48 +7243,235 @@ end
 -- ===== CONFIG TAB =====
 local configFrame = tabFrames["Config"]
 
+local CONFIG_FOLDER = "mm2run_configs"
+local CONFIG_VERSION = 2
+local CONFIG_MAX_COUNT = 9999
+
 local configNameBox = createInput(configFrame, "Config name:", "")
+local configsStatus
+local RefreshConfigsList
+
+local function setConfigStatus(text, color)
+	if configsStatus then
+		configsStatus.Text = tostring(text)
+		configsStatus.TextColor3 = color or Color3.fromRGB(120, 255, 160)
+	end
+	print("[mm2run/config] " .. tostring(text))
+end
+
+local function sanitizeConfigName(raw)
+	local name = tostring(raw or "")
+	name = string.gsub(name, "^%s+", "")
+	name = string.gsub(name, "%s+$", "")
+	name = string.gsub(name, "[%z\1-\31/\\:*?\"<>|]", "_")
+	name = string.gsub(name, "%s+", " ")
+	if #name > 48 then name = string.sub(name, 1, 48) end
+	if name == "" or name == "." or name == ".." then return nil end
+	return name
+end
+
+local function configFilePath(name)
+	return CONFIG_FOLDER .. "/" .. name .. ".json"
+end
+
+local function decodeJson(text)
+	local ok, data = pcall(function()
+		return game:GetService("HttpService"):JSONDecode(text)
+	end)
+	if ok and type(data) == "table" then return data end
+	return nil
+end
+
+local function readConfigData(path)
+	if not isfile(path) then return nil, "file not found" end
+	local ok, content = pcall(readfile, path)
+	if not ok or type(content) ~= "string" or content == "" then
+		return nil, "unreadable"
+	end
+	local data = decodeJson(content)
+	if not data then return nil, "invalid JSON" end
+	return data
+end
+
+local function readConfigWithBackup(path)
+	local data, err = readConfigData(path)
+	if data then return data, false, nil end
+	local backupData, backupErr = readConfigData(path .. ".bak")
+	if backupData then return backupData, true, err end
+	return nil, false, err or backupErr
+end
+
+local function sanitizeCounts(rawCounts)
+	if type(rawCounts) ~= "table" then return nil, 0 end
+	local clean = {}
+	local total = 0
+	for rawName, rawAmount in pairs(rawCounts) do
+		if type(rawName) == "string" and rawName ~= "" then
+			local amount = tonumber(rawAmount)
+			if amount and amount > 0 then
+				amount = math.floor(amount + 0.00001)
+				if amount > CONFIG_MAX_COUNT then amount = CONFIG_MAX_COUNT end
+				clean[rawName] = (clean[rawName] or 0) + amount
+				total = total + amount
+			end
+		end
+	end
+	return clean, total
+end
+
+local function countSnapshotEntries(counts)
+	local total = 0
+	for _, amount in pairs(counts or {}) do
+		local numeric = tonumber(amount)
+		if numeric and numeric > 0 then
+			total = total + math.floor(numeric)
+		end
+	end
+	return total
+end
+
+local function saveConfig(rawName)
+	local name = sanitizeConfigName(rawName)
+	if not name then
+		setConfigStatus("Config name is empty", Color3.fromRGB(255, 110, 110))
+		return false
+	end
+	local savedWeapons, savedPets = 0, 0
+	local ok, err = pcall(function()
+		if not isfolder(CONFIG_FOLDER) then
+			makefolder(CONFIG_FOLDER)
+		end
+		local weapons = InventoryOverlay.BuildVisibleCounts("Weapons")
+		local pets = InventoryOverlay.BuildVisibleCounts("Pets")
+		local weaponsCount = countSnapshotEntries(weapons)
+		local petsCount = countSnapshotEntries(pets)
+		if weaponsCount + petsCount <= 0 then
+			error("inventory is empty - nothing to save")
+		end
+
+		local snapshot = {
+			_meta = {
+				version = CONFIG_VERSION,
+				savedAt = os.time(),
+				savedAtText = os.date("%Y-%m-%d %H:%M:%S"),
+				weapons = weaponsCount,
+				pets = petsCount,
+			},
+			Weapons = weapons,
+			Pets = pets,
+		}
+		local json = game:GetService("HttpService"):JSONEncode(snapshot)
+		local path = configFilePath(name)
+		local tmpPath = path .. ".tmp"
+
+		-- Write to temp and verify before touching the previous config.
+		writefile(tmpPath, json)
+		local verify = readConfigData(tmpPath)
+		if not verify then
+			error("saved file did not validate")
+		end
+		if isfile(path) then
+			local oldContent = nil
+			pcall(function() oldContent = readfile(path) end)
+			if type(oldContent) == "string" and oldContent ~= "" then
+				pcall(writefile, path .. ".bak", oldContent)
+			end
+			pcall(delfile, path)
+		end
+		writefile(path, json)
+		pcall(delfile, tmpPath)
+		savedWeapons, savedPets = weaponsCount, petsCount
+	end)
+	if not ok then
+		setConfigStatus("Save failed: " .. tostring(err), Color3.fromRGB(255, 110, 110))
+		return false
+	end
+	setConfigStatus(("Saved %s (%d weapons / %d pets)"):format(name, savedWeapons, savedPets))
+	RefreshConfigsList()
+	return true
+end
+
+local function loadConfigFromPath(name, path)
+	local data, fromBackup, readErr = readConfigWithBackup(path)
+	if not data then
+		setConfigStatus(("Load failed: %s"):format(tostring(readErr or "invalid config")), Color3.fromRGB(255, 110, 110))
+		return false
+	end
+	local meta = type(data._meta) == "table" and data._meta or {}
+	local isV2 = (tonumber(meta.version) or 0) >= 2
+	local weapons, weaponsTotal = sanitizeCounts(data.Weapons)
+	local pets, petsTotal = sanitizeCounts(data.Pets)
+	local applyWeapons = type(data.Weapons) == "table" and (weaponsTotal > 0 or isV2)
+	local applyPets = type(data.Pets) == "table" and (petsTotal > 0 or isV2)
+
+	if not applyWeapons and not applyPets then
+		setConfigStatus("Load failed: config has no valid items", Color3.fromRGB(255, 110, 110))
+		return false
+	end
+
+	local ok, err = pcall(function()
+		if applyWeapons then
+			InventoryOverlay.SetVisibleOwnedSnapshot("Weapons", weapons, false)
+		end
+		if applyPets then
+			InventoryOverlay.SetVisibleOwnedSnapshot("Pets", pets, false)
+		end
+		InventoryOverlay.FireInventoryDataChanged()
+		pcall(Analytics.ResetInventoryGainBaseline)
+	end)
+	if not ok then
+		setConfigStatus("Load failed: " .. tostring(err), Color3.fromRGB(255, 110, 110))
+		return false
+	end
+
+	local suffix = fromBackup and " (backup)" or ""
+	setConfigStatus(("Loaded %s%s: %d weapons / %d pets"):format(
+		name,
+		suffix,
+		applyWeapons and weaponsTotal or 0,
+		applyPets and petsTotal or 0
+	))
+	return true
+end
+
+local function loadConfig(rawName)
+	local name = sanitizeConfigName(rawName)
+	if not name then
+		setConfigStatus("Config name is empty", Color3.fromRGB(255, 110, 110))
+		return false
+	end
+	return loadConfigFromPath(name, configFilePath(name))
+end
 
 createButton(configFrame, "Save Config", function()
-    local name = configNameBox.Text
-    if name == "" then
-        print("[mm2run/config] empty name")
-        return
-    end
+	saveConfig(configNameBox.Text)
+end)
 
-    pcall(function()
-        if not isfolder("mm2run_configs") then
-            makefolder("mm2run_configs")
-        end
-        local snapshot = {}
-        snapshot.Weapons = InventoryOverlay.BuildVisibleCounts("Weapons")
-        snapshot.Pets = InventoryOverlay.BuildVisibleCounts("Pets")
-
-        local json = game:GetService("HttpService"):JSONEncode(snapshot)
-        writefile("mm2run_configs/" .. name .. ".json", json)
-        print("[mm2run/config] saved: " .. name)
-        RefreshConfigsList()
-    end)
+createButton(configFrame, "Refresh config list", function()
+	RefreshConfigsList()
 end)
 
 local clearBtn = createButton(configFrame, "Clear Inventory", function()
-    pcall(function()
-        InventoryOverlay.SetVisibleOwnedSnapshot("Weapons", {}, false)
-        InventoryOverlay.SetVisibleOwnedSnapshot("Pets", {}, false)
-        InventoryOverlay.FireInventoryDataChanged()
-        pcall(Analytics.ResetInventoryGainBaseline)
-        print("[mm2run/config] inventory cleared")
-    end)
+	pcall(function()
+		InventoryOverlay.SetVisibleOwnedSnapshot("Weapons", {}, false)
+		InventoryOverlay.SetVisibleOwnedSnapshot("Pets", {}, false)
+		InventoryOverlay.FireInventoryDataChanged()
+		pcall(Analytics.ResetInventoryGainBaseline)
+		if _G.ClearAllWeaponDisplays then
+			pcall(_G.ClearAllWeaponDisplays)
+		end
+		setConfigStatus("Inventory cleared", Color3.fromRGB(255, 210, 120))
+	end)
 end)
 clearBtn.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
 clearBtn.MouseEnter:Connect(function()
-    TweenService:Create(clearBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(220, 60, 60)}):Play()
+	TweenService:Create(clearBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(220, 60, 60)}):Play()
 end)
 clearBtn.MouseLeave:Connect(function()
-    TweenService:Create(clearBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(255, 80, 80)}):Play()
+	TweenService:Create(clearBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(255, 80, 80)}):Play()
 end)
 
-local configsStatus = Instance.new("TextLabel")
+configsStatus = Instance.new("TextLabel")
 configsStatus.Size = UDim2.new(1, 0, 0, 15)
 configsStatus.BackgroundTransparency = 1
 configsStatus.Text = "Saved configs:"
@@ -7239,115 +7493,143 @@ configsScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 configsScroll.Parent = configFrame
 
 do
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, 5)
-    c.Parent = configsScroll
-    local lay = Instance.new("UIListLayout")
-    lay.FillDirection = Enum.FillDirection.Vertical
-    lay.SortOrder = Enum.SortOrder.LayoutOrder
-    lay.Padding = UDim.new(0, 4)
-    lay.Parent = configsScroll
-    local pad = Instance.new("UIPadding")
-    pad.PaddingTop = UDim.new(0, 4)
-    pad.PaddingBottom = UDim.new(0, 4)
-    pad.PaddingLeft = UDim.new(0, 4)
-    pad.PaddingRight = UDim.new(0, 4)
-    pad.Parent = configsScroll
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 5)
+	c.Parent = configsScroll
+	local lay = Instance.new("UIListLayout")
+	lay.FillDirection = Enum.FillDirection.Vertical
+	lay.SortOrder = Enum.SortOrder.LayoutOrder
+	lay.Padding = UDim.new(0, 4)
+	lay.Parent = configsScroll
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 4)
+	pad.PaddingBottom = UDim.new(0, 4)
+	pad.PaddingLeft = UDim.new(0, 4)
+	pad.PaddingRight = UDim.new(0, 4)
+	pad.Parent = configsScroll
 end
 
 local function _updateConfigsScrollHeight()
-    local offsetY = configsScroll.AbsolutePosition.Y - configFrame.AbsolutePosition.Y
-    local available = configFrame.AbsoluteSize.Y - offsetY - 4
-    configsScroll.Size = UDim2.new(1, 0, 0, math.max(80, available))
+	local offsetY = configsScroll.AbsolutePosition.Y - configFrame.AbsolutePosition.Y
+	local available = configFrame.AbsoluteSize.Y - offsetY - 4
+	configsScroll.Size = UDim2.new(1, 0, 0, math.max(80, available))
 end
 configFrame:GetPropertyChangedSignal("AbsoluteSize"):Connect(_updateConfigsScrollHeight)
 task.defer(_updateConfigsScrollHeight)
 
-local function RefreshConfigsList()
-    for _, child in pairs(configsScroll:GetChildren()) do
-        if child:IsA("Frame") or child:IsA("TextButton") then child:Destroy() end
-    end
+RefreshConfigsList = function()
+	for _, child in pairs(configsScroll:GetChildren()) do
+		if child:IsA("Frame") or child:IsA("TextButton") or child:IsA("TextLabel") then
+			child:Destroy()
+		end
+	end
 
-    pcall(function()
-        if not isfolder("mm2run_configs") then return end
-        local files = listfiles("mm2run_configs")
-        for _, filePath in ipairs(files) do
-            if string.sub(filePath, -5) == ".json" then
-                local name = string.match(filePath, "([^/\\]+)%.json$") or "unknown"
+	local entries = {}
+	pcall(function()
+		if not isfolder(CONFIG_FOLDER) then
+			makefolder(CONFIG_FOLDER)
+		end
+		for _, filePath in ipairs(listfiles(CONFIG_FOLDER)) do
+			local fileName = string.match(filePath, "([^/\\]+)$")
+			local baseName = fileName and string.match(fileName, "^(.-)%.json$") or nil
+			if baseName and not string.match(baseName, "%.bak$") and not string.match(baseName, "%.tmp$") then
+				table.insert(entries, {name = baseName, path = filePath})
+			end
+		end
+	end)
+	table.sort(entries, function(a, b)
+		return string.lower(a.name) < string.lower(b.name)
+	end)
 
-                local row = Instance.new("Frame")
-                row.Size = UDim2.new(1, -6, 0, 32)
-                row.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
-                row.BackgroundTransparency = 0.3
-                row.Parent = configsScroll
+	if #entries == 0 then
+		local emptyLabel = Instance.new("TextLabel")
+		emptyLabel.Size = UDim2.new(1, -8, 0, 28)
+		emptyLabel.BackgroundTransparency = 1
+		emptyLabel.Text = "No saved configs yet. Save one above."
+		emptyLabel.Font = Enum.Font.Gotham
+		emptyLabel.TextSize = 12
+		emptyLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
+		emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+		emptyLabel.Parent = configsScroll
+		return
+	end
 
-                local rc = Instance.new("UICorner")
-                rc.CornerRadius = UDim.new(0, 6)
-                rc.Parent = row
+	for _, entry in ipairs(entries) do
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, -6, 0, 32)
+		row.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+		row.BackgroundTransparency = 0.3
+		row.Parent = configsScroll
 
-                local nameLbl = Instance.new("TextLabel")
-                nameLbl.Size = UDim2.new(0.5, -8, 1, 0)
-                nameLbl.Position = UDim2.new(0, 8, 0, 0)
-                nameLbl.BackgroundTransparency = 1
-                nameLbl.Text = name
-                nameLbl.Font = Enum.Font.GothamSemibold
-                nameLbl.TextSize = 12
-                nameLbl.TextColor3 = Color3.fromRGB(240, 240, 250)
-                nameLbl.TextXAlignment = Enum.TextXAlignment.Left
-                nameLbl.Parent = row
+		local rc = Instance.new("UICorner")
+		rc.CornerRadius = UDim.new(0, 6)
+		rc.Parent = row
 
-                local loadBtn = Instance.new("TextButton")
-                loadBtn.Size = UDim2.new(0.22, -4, 0.75, 0)
-                loadBtn.Position = UDim2.new(0.52, 2, 0.125, 0)
-                loadBtn.BackgroundColor3 = Color3.fromRGB(60, 180, 80)
-                loadBtn.Text = "Load"
-                loadBtn.Font = Enum.Font.Gotham
-                loadBtn.TextSize = 11
-                loadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-                loadBtn.Parent = row
+		local nameLbl = Instance.new("TextLabel")
+		nameLbl.Size = UDim2.new(0.5, -8, 1, 0)
+		nameLbl.Position = UDim2.new(0, 8, 0, 0)
+		nameLbl.BackgroundTransparency = 1
+		nameLbl.Text = entry.name
+		nameLbl.Font = Enum.Font.GothamSemibold
+		nameLbl.TextSize = 12
+		nameLbl.TextColor3 = Color3.fromRGB(240, 240, 250)
+		nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+		nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+		nameLbl.Parent = row
 
-                local lc = Instance.new("UICorner")
-                lc.CornerRadius = UDim.new(0, 4)
-                lc.Parent = loadBtn
+		local loadBtn = Instance.new("TextButton")
+		loadBtn.Size = UDim2.new(0.22, -4, 0.75, 0)
+		loadBtn.Position = UDim2.new(0.52, 2, 0.125, 0)
+		loadBtn.BackgroundColor3 = Color3.fromRGB(60, 180, 80)
+		loadBtn.Text = "Load"
+		loadBtn.Font = Enum.Font.Gotham
+		loadBtn.TextSize = 11
+		loadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		loadBtn.Parent = row
 
-                local delBtn = Instance.new("TextButton")
-                delBtn.Size = UDim2.new(0.22, -4, 0.75, 0)
-                delBtn.Position = UDim2.new(0.76, 2, 0.125, 0)
-                delBtn.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
-                delBtn.Text = "Del"
-                delBtn.Font = Enum.Font.Gotham
-                delBtn.TextSize = 11
-                delBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-                delBtn.Parent = row
+		local lc = Instance.new("UICorner")
+		lc.CornerRadius = UDim.new(0, 4)
+		lc.Parent = loadBtn
 
-                local dc = Instance.new("UICorner")
-                dc.CornerRadius = UDim.new(0, 4)
-                dc.Parent = delBtn
+		local delBtn = Instance.new("TextButton")
+		delBtn.Size = UDim2.new(0.22, -4, 0.75, 0)
+		delBtn.Position = UDim2.new(0.76, 2, 0.125, 0)
+		delBtn.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
+		delBtn.Text = "Del"
+		delBtn.Font = Enum.Font.Gotham
+		delBtn.TextSize = 11
+		delBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		delBtn.Parent = row
 
-                loadBtn.MouseButton1Click:Connect(function()
-                    pcall(function()
-                        local path = "mm2run_configs/" .. name .. ".json"
-                        local data = game:GetService("HttpService"):JSONDecode(readfile(path))
+		local dc = Instance.new("UICorner")
+		dc.CornerRadius = UDim.new(0, 4)
+		dc.Parent = delBtn
 
-                        InventoryOverlay.SetVisibleOwnedSnapshot("Weapons", data.Weapons or {}, false)
-                        InventoryOverlay.SetVisibleOwnedSnapshot("Pets", data.Pets or {}, false)
-                        InventoryOverlay.FireInventoryDataChanged()
-                        pcall(Analytics.ResetInventoryGainBaseline)
-                        print("[mm2run/config] loaded: " .. name)
-                    end)
-                end)
+		loadBtn.MouseButton1Click:Connect(function()
+			loadConfigFromPath(entry.name, entry.path)
+		end)
 
-                delBtn.MouseButton1Click:Connect(function()
-                    pcall(function()
-                        delfile("mm2run_configs/" .. name .. ".json")
-                        print("[mm2run/config] deleted: " .. name)
-                        RefreshConfigsList()
-                    end)
-                end)
-            end
-        end
-    end)
+		delBtn.MouseButton1Click:Connect(function()
+			local ok = pcall(function()
+				delfile(entry.path)
+				delfile(entry.path .. ".bak")
+				delfile(entry.path .. ".tmp")
+			end)
+			if ok then
+				setConfigStatus("Deleted " .. entry.name, Color3.fromRGB(255, 210, 120))
+			else
+				setConfigStatus("Delete failed: " .. entry.name, Color3.fromRGB(255, 110, 110))
+			end
+			RefreshConfigsList()
+		end)
+	end
 end
+
+_G.TortiConfig = {
+	Save = saveConfig,
+	Load = loadConfig,
+	List = function() RefreshConfigsList() end,
+}
 
 RefreshConfigsList()
 
@@ -7672,12 +7954,21 @@ local function createItemsTabWeaponButton(entry)
 end
 
 local allWeaponsList = {}
-local _seenKeys = {}
+local _legacyKeys = {}
+local _seenNames = {}
 for _, name in ipairs(ItemsTabAllowedNames) do
     local best = findBestWeaponCatalogEntry(_itemsTabNormalize(name))
-    if best and not _seenKeys[best.key] then
-        table.insert(allWeaponsList, best)
-        _seenKeys[best.key] = true
+    if best then _legacyKeys[best.key] = true end
+end
+
+-- Build the Items tab from the live weapon catalog instead of a static name
+-- list. This automatically includes every 2024+ release plus all high-rarity
+-- weapons, and dedupes display variants so the tab stays readable.
+for _, entry in ipairs(WeaponCatalog) do
+    local dedupeKey = NormalizeItemName(entry.name) .. "|" .. tostring(entry.type) .. "|" .. tostring(entry.chroma == true)
+    if not _seenNames[dedupeKey] and (_legacyKeys[entry.key] or ShouldAutoIncludeWeapon(entry)) then
+        _seenNames[dedupeKey] = true
+        table.insert(allWeaponsList, entry)
     end
 end
 
@@ -8242,7 +8533,7 @@ end
 for _, entry in ipairs(WeaponCatalog) do
     local wKey = entry.key
     local wData = (Sync.Weapons and Sync.Weapons[wKey]) or (Sync.Item and Sync.Item[wKey])
-	if _isSpawnerAllowed(entry.name) then
+	if _isSpawnerAllowed(entry.name, entry) then
 		local tradable = _isTradable(wData)
 		local ok, cardInfo = pcall(createSpawnerCard, entry, tradable)
 		if ok and cardInfo then
@@ -8716,85 +9007,206 @@ print("[mm2run] System merged and running successfully!")
 local WeaponDisplaySystem = (function()
 	local LocalPlayer = Players.LocalPlayer
 	local activeDisplays = {}
+	local activeByKey = {}
+	local equippedDisplays = {}
+	local watchedCharacters = setmetatable({}, {__mode = "k"})
 	local displayCounter = 0
 
 	local ATTACHMENT_MAP = {
-		Knife = {part = "UpperTorso", name = "KnifeBack", fallbackPos = Vector3.new(-0.07, -0.18, 0.55)},
-		Gun   = {part = "LowerTorso", name = "GunBelt",     fallbackPos = Vector3.new(0.84, -0.26, 0.00)},
+		Knife = {
+			parts = {"UpperTorso", "Torso"},
+			name = "KnifeBack",
+			fallbackPos = Vector3.new(-0.07, -0.18, 0.55),
+			fallbackAngles = Vector3.new(0, 0, -18),
+		},
+		Gun = {
+			parts = {"LowerTorso", "Torso"},
+			name = "GunBelt",
+			fallbackPos = Vector3.new(0.84, -0.26, 0.00),
+			fallbackAngles = Vector3.new(0, 0, 0),
+		},
 	}
 
 	local function getBodyAttachment(character, weaponType)
 		local map = ATTACHMENT_MAP[weaponType]
 		if not map then return nil end
-		local bodyPart = character:FindFirstChild(map.part)
+		local bodyPart = nil
+		for _, partName in ipairs(map.parts) do
+			bodyPart = character:FindFirstChild(partName)
+			if bodyPart then break end
+		end
 		if not bodyPart then return nil end
 		local existing = bodyPart:FindFirstChild(map.name)
-		if existing then return existing end
+		if existing and existing:IsA("Attachment") then return existing end
 		local att = Instance.new("Attachment")
 		att.Name = map.name
-		att.CFrame = CFrame.new(map.fallbackPos)
+		local angles = map.fallbackAngles
+		if angles then
+			att.CFrame = CFrame.new(map.fallbackPos) * CFrame.Angles(math.rad(angles.X), math.rad(angles.Y), math.rad(angles.Z))
+		else
+			att.CFrame = CFrame.new(map.fallbackPos)
+		end
 		att.Parent = bodyPart
 		return att
 	end
 
-	local function clearDisplay(id)
-		if activeDisplays[id] then
-			for _, obj in pairs(activeDisplays[id].parts) do
-				pcall(function() obj:Destroy() end)
-			end
-			activeDisplays[id] = nil
+	local function normalizeWeaponLookup(name)
+		return NormalizeItemName(tostring(name or ""))
+	end
+
+	local function resolveWeaponEntry(weaponKey)
+		if type(weaponKey) ~= "string" or weaponKey == "" then return nil end
+		return WeaponByKey[weaponKey]
+			or WeaponByName[string.lower(weaponKey)]
+			or WeaponByNormalizedName[normalizeWeaponLookup(weaponKey)]
+	end
+
+	local function getWeaponData(weaponKey)
+		local entry = resolveWeaponEntry(weaponKey)
+		if entry then
+			local data = GetWeaponSyncData(entry)
+			if data then return data, entry end
 		end
+		if type(Sync.Weapons) == "table" and type(Sync.Weapons[weaponKey]) == "table" then
+			return Sync.Weapons[weaponKey], nil
+		end
+		if type(Sync.Item) == "table" and type(Sync.Item[weaponKey]) == "table" then
+			return Sync.Item[weaponKey], nil
+		end
+		return nil, entry
+	end
+
+	local function getWeaponAliases(weaponKey)
+		local aliases, seen = {}, {}
+		local function add(value)
+			if type(value) ~= "string" or value == "" then return end
+			local key = string.lower(value)
+			if seen[key] then return end
+			seen[key] = true
+			table.insert(aliases, value)
+		end
+		add(weaponKey)
+		local entry = resolveWeaponEntry(weaponKey)
+		if entry then
+			add(entry.key)
+			add(entry.name)
+			local data = GetWeaponSyncData(entry)
+			if data then
+				add(data.ItemName)
+				add(data.Name)
+				add(data.DisplayName)
+			end
+		end
+		return aliases
+	end
+
+	local function getWeaponType(weaponKey)
+		local entry = resolveWeaponEntry(weaponKey)
+		if entry and (entry.type == "Knife" or entry.type == "Gun") then
+			return entry.type
+		end
+		local data = getWeaponData(weaponKey)
+		if data and (data.ItemType == "Knife" or data.ItemType == "Gun") then
+			return data.ItemType
+		end
+		local lowered = string.lower(tostring(weaponKey or ""))
+		if string.find(lowered, "gun", 1, true) then return "Gun" end
+		return "Knife"
+	end
+
+	local function getDisplayKey(weaponKey, weaponType)
+		local entry = resolveWeaponEntry(weaponKey)
+		local displayName = entry and entry.name or weaponKey
+		return normalizeWeaponLookup(displayName) .. "|" .. tostring(weaponType or getWeaponType(weaponKey))
+	end
+
+	local function isInsideDisplaysFolder(instance)
+		local node = instance
+		while node do
+			if node.Name == "WeaponDisplays" and node.Parent == workspace then
+				return true
+			end
+			node = node.Parent
+		end
+		return false
+	end
+
+	local function clearDisplay(id)
+		local data = activeDisplays[id]
+		if not data then return end
+		for _, obj in pairs(data.parts) do
+			pcall(function() obj:Destroy() end)
+		end
+		if data.displayKey then
+			activeByKey[data.displayKey] = nil
+		end
+		activeDisplays[id] = nil
+	end
+
+	local function addOwner(id, owner)
+		local data = activeDisplays[id]
+		if not data then return end
+		if not data.owners then data.owners = {} end
+		data.owners[tostring(owner or "manual")] = true
+	end
+
+	local function removeOwner(id, owner)
+		local data = activeDisplays[id]
+		if not data then return end
+		if data.owners then
+			data.owners[tostring(owner or "manual")] = nil
+			if next(data.owners) ~= nil then
+				return
+			end
+		end
+		clearDisplay(id)
 	end
 
 	local function clearAllOfType(weaponType)
+		local toRemove = {}
 		for id, data in pairs(activeDisplays) do
 			if data.weaponType == weaponType then
-				for _, obj in pairs(data.parts) do
-					pcall(function() obj:Destroy() end)
-				end
-				activeDisplays[id] = nil
+				table.insert(toRemove, id)
 			end
+		end
+		for _, id in ipairs(toRemove) do
+			clearDisplay(id)
 		end
 	end
 
 	local function findWeaponHandle(weaponKey)
-		-- Strategy 1: Find equipped tool on any player
+		local aliases = getWeaponAliases(weaponKey)
+
+		-- Strategy 1: equipped tool / backpack tool on any player
 		for _, player in ipairs(Players:GetPlayers()) do
 			local char = player.Character
 			if char then
-				local backpack = player:FindFirstChild("Backpack")
-				if backpack then
-					for _, tool in ipairs(backpack:GetChildren()) do
-						if tool:IsA("Tool") and tool.Name == weaponKey then
-							local handle = tool:FindFirstChild("Handle")
-							if handle then return handle end
+				local containers = {char, player:FindFirstChild("Backpack")}
+				for _, container in ipairs(containers) do
+					if container then
+						for _, tool in ipairs(container:GetChildren()) do
+							if tool:IsA("Tool") then
+								for _, alias in ipairs(aliases) do
+									if tool.Name == alias then
+										local handle = tool:FindFirstChild("Handle")
+										if handle then return handle end
+									end
+								end
+							end
 						end
 					end
 				end
-				for _, tool in ipairs(char:GetChildren()) do
-					if tool:IsA("Tool") and tool.Name == weaponKey then
-						local handle = tool:FindFirstChild("Handle")
-						if handle then return handle end
-					end
-				end
 			end
 		end
 
-		-- Strategy 2: Load via InsertService using ItemID from _G.Database
-		local itemID = nil
-		if _G.Database and _G.Database.Item then
-			local data = _G.Database.Item[weaponKey]
-			if data and data.ItemID then
-				itemID = tonumber(data.ItemID)
-			end
+		-- Strategy 2: load the real weapon asset through Sync's ItemID
+		local data = getWeaponData(weaponKey)
+		local itemID = data and tonumber(data.ItemID) or nil
+		if not itemID and _G.Database then
+			local db = _G.Database
+			local itemData = (db.Item and db.Item[weaponKey]) or (db.Weapons and db.Weapons[weaponKey])
+			if itemData then itemID = tonumber(itemData.ItemID) end
 		end
-		if not itemID and _G.Database and _G.Database.Weapons then
-			local data = _G.Database.Weapons[weaponKey]
-			if data and data.ItemID then
-				itemID = tonumber(data.ItemID)
-			end
-		end
-
 		if itemID then
 			print("[WeaponDisplay] Loading asset ID", itemID, "for", weaponKey)
 			pcall(function() setthreadidentity(2) end)
@@ -8803,42 +9215,30 @@ local WeaponDisplaySystem = (function()
 				return InsertService:LoadAsset(itemID)
 			end)
 			if success and model then
-				print("[WeaponDisplay] Asset loaded successfully for", weaponKey)
-				local handle = model:FindFirstChild("Handle")
+				local handle = model:FindFirstChild("Handle", true)
 				if handle then
 					handle.Parent = workspace
 					model:Destroy()
 					pcall(function() setthreadidentity(8) end)
 					return handle
 				end
-				-- Search recursively
-				local function findHandleRecursive(parent)
-					for _, child in ipairs(parent:GetChildren()) do
-						if child.Name == "Handle" then return child end
-						local found = findHandleRecursive(child)
-						if found then return found end
-					end
-					return nil
-				end
-				local h = findHandleRecursive(model)
-				if h then
-					h.Parent = workspace
-					model:Destroy()
-					pcall(function() setthreadidentity(8) end)
-					return h
-				end
 				model:Destroy()
 			end
+			pcall(function() setthreadidentity(8) end)
 		end
 
-		-- Strategy 3: Search Workspace for any Tool with matching name
+		-- Strategy 3: any matching tool in Workspace
 		local function searchWorkspace(parent, depth)
 			depth = depth or 0
 			if depth > 4 then return nil end
 			for _, child in ipairs(parent:GetChildren()) do
-				if child:IsA("Tool") and child.Name == weaponKey then
-					local handle = child:FindFirstChild("Handle")
-					if handle then return handle end
+				if child:IsA("Tool") and not isInsideDisplaysFolder(child) then
+					for _, alias in ipairs(aliases) do
+						if child.Name == alias then
+							local handle = child:FindFirstChild("Handle")
+							if handle then return handle end
+						end
+					end
 				end
 				if child:IsA("Folder") or child:IsA("Model") then
 					local found = searchWorkspace(child, depth + 1)
@@ -8847,35 +9247,100 @@ local WeaponDisplaySystem = (function()
 			end
 			return nil
 		end
-
 		return searchWorkspace(workspace)
 	end
 
-	local function createWeaponDisplay(weaponKey, weaponType)
+	local function buildFallbackHandle(weaponKey, weaponType)
+		local handle = Instance.new("Part")
+		handle.Name = "Handle"
+		handle.Size = Vector3.new(0.16, 0.16, 0.65)
+		handle.Color = weaponType == "Gun" and Color3.fromRGB(55, 65, 80) or Color3.fromRGB(190, 195, 205)
+		handle.Material = Enum.Material.Metal
+		handle.Anchored = false
+		handle.CanCollide = false
+		handle.CanQuery = false
+		handle.CanTouch = false
+		handle.Massless = true
+		handle.TopSurface = Enum.SurfaceType.Smooth
+		handle.BottomSurface = Enum.SurfaceType.Smooth
+
+		local blade = Instance.new("Part")
+		blade.Name = "Blade"
+		blade.Anchored = false
+		blade.CanCollide = false
+		blade.CanQuery = false
+		blade.CanTouch = false
+		blade.Massless = true
+		blade.Material = Enum.Material.Metal
+		blade.TopSurface = Enum.SurfaceType.Smooth
+		blade.BottomSurface = Enum.SurfaceType.Smooth
+		if weaponType == "Gun" then
+			blade.Size = Vector3.new(0.12, 0.12, 0.55)
+			blade.Color = Color3.fromRGB(35, 35, 40)
+			blade.CFrame = CFrame.new(0, 0.03, -0.42)
+		else
+			blade.Size = Vector3.new(0.07, 0.25, 0.7)
+			blade.Color = Color3.fromRGB(205, 210, 220)
+			blade.CFrame = CFrame.new(0, 0.08, -0.58)
+		end
+		blade.Parent = handle
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = handle
+		weld.Part1 = blade
+		weld.Parent = handle
+		print("[WeaponDisplay] Using fallback model for", weaponKey)
+		return handle
+	end
+
+	local function createWeaponDisplay(weaponKey, weaponType, owner, sourceHandle)
+		owner = tostring(owner or "manual")
+		weaponType = weaponType or getWeaponType(weaponKey)
+		local displayKey = getDisplayKey(weaponKey, weaponType)
+		local existingId = activeByKey[displayKey]
+		if existingId and activeDisplays[existingId] then
+			addOwner(existingId, owner)
+			return existingId, false
+		end
+
 		local character = LocalPlayer.Character
 		if not character then
-			warn("[WeaponDisplay] No character")
-			return
+			return nil, false
 		end
 
 		local bodyAttachment = getBodyAttachment(character, weaponType)
 		if not bodyAttachment then
-			warn("[WeaponDisplay] Body attachment not found for:", weaponType)
-			return
+			return nil, false
 		end
 
-		local originalHandle = findWeaponHandle(weaponKey)
-		if not originalHandle then
-			warn("[WeaponDisplay] Weapon not found:", weaponKey)
-			return
+		local originalHandle = sourceHandle
+		if not originalHandle or not originalHandle:IsA("BasePart") then
+			originalHandle = findWeaponHandle(weaponKey)
 		end
 
-		local handle = originalHandle:Clone()
+		local handle
+		if originalHandle then
+			local ok, clone = pcall(function()
+				return originalHandle:Clone()
+			end)
+			handle = ok and clone or nil
+		end
+		if not handle then
+			handle = buildFallbackHandle(weaponKey, weaponType)
+		end
+
 		handle.CanCollide = false
 		handle.Massless = true
 		handle.Anchored = false
 		handle.CanQuery = false
 		handle.CanTouch = false
+		for _, part in ipairs(handle:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.CanCollide = false
+				part.CanQuery = false
+				part.CanTouch = false
+				part.Massless = true
+			end
+		end
 
 		local weaponDisplays = workspace:FindFirstChild("WeaponDisplays")
 		if not weaponDisplays then
@@ -8885,12 +9350,12 @@ local WeaponDisplaySystem = (function()
 		end
 
 		displayCounter = displayCounter + 1
-		local displayId = weaponKey .. "_" .. displayCounter
-		handle.Name = weaponType .. "Display"
+		local displayId = tostring(weaponKey) .. "_" .. tostring(displayCounter)
+		handle.Name = tostring(weaponType) .. "Display"
 		handle.Parent = weaponDisplays
 
 		local weaponAttachment = handle:FindFirstChild("Attachment")
-		if not weaponAttachment then
+		if not weaponAttachment or not weaponAttachment:IsA("Attachment") then
 			weaponAttachment = Instance.new("Attachment")
 			weaponAttachment.Name = "Attachment"
 			weaponAttachment.CFrame = CFrame.new(0, 0, 0)
@@ -8915,19 +9380,21 @@ local WeaponDisplaySystem = (function()
 			parts = {handle, constraint},
 			weaponType = weaponType,
 			weaponKey = weaponKey,
+			displayKey = displayKey,
+			owners = {[owner] = true},
 		}
+		activeByKey[displayKey] = displayId
 
 		character.Destroying:Connect(function()
-			pcall(function() handle:Destroy() end)
+			clearDisplay(displayId)
 		end)
 
 		print("[WeaponDisplay] Equipped:", weaponKey, "as", weaponType, "(id:", displayId .. ")")
-		return displayId
+		return displayId, true
 	end
 
-	local function equipWeapon(weaponKey, weaponType)
-		weaponType = weaponType or "Knife"
-		return createWeaponDisplay(weaponKey, weaponType)
+	local function equipWeapon(weaponKey, weaponType, owner)
+		return createWeaponDisplay(weaponKey, weaponType, owner or "manual")
 	end
 
 	local function unequipWeapon(weaponType)
@@ -8952,39 +9419,87 @@ local WeaponDisplaySystem = (function()
 			end
 		end
 		activeDisplays = {}
+		activeByKey = {}
+		for tool in pairs(equippedDisplays) do
+			equippedDisplays[tool] = nil
+		end
 		displayCounter = 0
 	end
 
-	LocalPlayer.CharacterAdded:Connect(function()
-		clearAll()
-	end)
-
-	local function cleanupFakeItems(realItemName)
-		local normalizedReal = string.lower(tostring(realItemName or ""))
-		local cleaned = {}
-
-		for id, data in pairs(activeDisplays) do
-			local normalizedFake = string.lower(tostring(data.weaponKey or ""))
-			if normalizedFake == normalizedReal then
-				for _, obj in pairs(data.parts) do
-					pcall(function() obj:Destroy() end)
-				end
-				activeDisplays[id] = nil
-				table.insert(cleaned, data.weaponKey)
+	local function watchCharacter(character)
+		if not character or watchedCharacters[character] then return end
+		watchedCharacters[character] = true
+		local function showTool(tool, attempt)
+			if not tool or not tool.Parent or tool.Parent ~= character then return end
+			local handle = tool:FindFirstChild("Handle")
+			if not handle and (attempt or 0) < 6 then
+				task.delay(0.1, function()
+					showTool(tool, (attempt or 0) + 1)
+				end)
+				return
+			end
+			local id, created = createWeaponDisplay(tool.Name, getWeaponType(tool.Name), "tool:" .. tostring(tool), handle)
+			if id and created then
+				equippedDisplays[tool] = id
 			end
 		end
+		local function hideTool(tool)
+			local id = equippedDisplays[tool]
+			if id then
+				equippedDisplays[tool] = nil
+				removeOwner(id, "tool:" .. tostring(tool))
+			end
+		end
+		for _, child in ipairs(character:GetChildren()) do
+			if child:IsA("Tool") then
+				task.defer(showTool, child, 0)
+			end
+		end
+		character.ChildAdded:Connect(function(child)
+			if child:IsA("Tool") then
+				task.defer(showTool, child, 0)
+			end
+		end)
+		character.ChildRemoved:Connect(function(child)
+			if child:IsA("Tool") then
+				task.defer(hideTool, child)
+			end
+		end)
+	end
 
+	LocalPlayer.CharacterAdded:Connect(function(character)
+		clearAll()
+		task.defer(watchCharacter, character)
+	end)
+	if LocalPlayer.Character then
+		task.defer(watchCharacter, LocalPlayer.Character)
+	end
+
+	local function cleanupFakeItems(realItemName)
+		local normalizedReal = normalizeWeaponLookup(realItemName)
+		local toRemove = {}
+		for id, data in pairs(activeDisplays) do
+			local normalizedFake = normalizeWeaponLookup(data.weaponKey)
+			if normalizedFake == normalizedReal and data.owners and data.owners.fake then
+				data.owners.fake = nil
+				if next(data.owners) == nil then
+					table.insert(toRemove, id)
+				end
+			end
+		end
+		for _, id in ipairs(toRemove) do
+			clearDisplay(id)
+		end
 		local newFakeList = {}
 		for _, fakeEntry in ipairs(FakeSpawnedItems) do
-			local normalizedFake = string.lower(tostring(fakeEntry.name or ""))
+			local normalizedFake = normalizeWeaponLookup(fakeEntry.name)
 			if normalizedFake ~= normalizedReal then
 				table.insert(newFakeList, fakeEntry)
 			end
 		end
 		FakeSpawnedItems = newFakeList
-
-		if #cleaned > 0 then
-			print("[WeaponDisplay] Cleaned up", #cleaned, "fake display(s) for:", realItemName)
+		if #toRemove > 0 then
+			print("[WeaponDisplay] Manually cleaned", #toRemove, "fake display(s) for:", realItemName)
 		end
 	end
 
@@ -8993,6 +9508,8 @@ local WeaponDisplaySystem = (function()
 		Unequip = unequipWeapon,
 		ClearAll = clearAll,
 		CleanupFakeItems = cleanupFakeItems,
+		WatchCharacter = watchCharacter,
+		GetWeaponType = getWeaponType,
 	}
 end)()
 
@@ -9399,11 +9916,12 @@ _G.SendFakeTrade = function(traderName, items)
 	FakeTradeSystem.SendRequest(traderName, items)
 end
 
-print("[Torti Hub v2.4] Visual weapon display system loaded!")
+print("[Torti Hub v2.5] Visual weapon display system loaded!")
 print("Usage: _G.EquipWeaponDisplay('Batwing', 'Knife') - shows weapon on character")
 print("       _G.UnequipWeaponDisplay('Knife') - removes all fake knives")
 print("       _G.ClearAllWeaponDisplays() - removes all weapons")
-print("       _G.CleanupFakeItemsForWeapon('Icewing') - removes fake Icewings (called automatically on real trade)")
+print("       Equipped tools are mirrored on the character automatically")
+print("       _G.CleanupFakeItemsForWeapon('Icewing') - manually removes fake Icewing displays")
 
 
 
